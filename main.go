@@ -29,7 +29,7 @@ func main() {
 
 	http.HandleFunc("/tokens", tokensHandler)
 	http.HandleFunc("/health", healthHandler)
-	http.ListenAndServe(":3001", nil)
+	http.ListenAndServe(":3002", nil)
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
