@@ -2,11 +2,13 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -18,9 +20,18 @@ var deviceURL string
 var deviceCode string
 var userCode string
 
-func main() {
-	profileUUID = loadUUID()
+var config Config
 
+type Config struct {
+	Port    string `json:"port"`
+	DataDir string `json:"data_dir"`
+}
+
+func main() {
+	config = loadConfig()
+	fmt.Printf("Starting on port %s, data dir: %s\n", config.Port, config.DataDir)
+
+	profileUUID = loadUUID()
 	refreshToken = loadToken()
 	if refreshToken != "" {
 		fmt.Println("Verifying stored token...")
@@ -39,7 +50,7 @@ func main() {
 	http.HandleFunc("/tokens", tokensHandler)
 	http.HandleFunc("/health", healthHandler)
 	http.HandleFunc("/", setupHandler)
-	http.ListenAndServe(":3002", nil)
+	http.ListenAndServe(":"+config.Port, nil)
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
@@ -48,7 +59,8 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func loadToken() string {
-	if data, err := os.ReadFile("refresh_token.txt"); err == nil {
+	path := filepath.Join(config.DataDir, "refresh_token.txt")
+	if data, err := os.ReadFile(path); err == nil {
 		token := strings.TrimSpace(string(data))
 		if token != "" {
 			return token
@@ -58,8 +70,8 @@ func loadToken() string {
 }
 
 func loadUUID() string {
-	if data, err := os.ReadFile("profile_uuid.txt"); err == nil {
-		// Strip BOM if present
+	path := filepath.Join(config.DataDir, "profile_uuid.txt")
+	if data, err := os.ReadFile(path); err == nil {
 		if len(data) >= 3 && data[0] == 0xef && data[1] == 0xbb && data[2] == 0xbf {
 			data = data[3:]
 		}
@@ -72,7 +84,8 @@ func loadUUID() string {
 }
 
 func saveUUID(uuid string) {
-	os.WriteFile("profile_uuid.txt", []byte(uuid), 0600)
+	path := filepath.Join(config.DataDir, "profile_uuid.txt")
+	os.WriteFile(path, []byte(uuid), 0600)
 }
 
 func refreshAccessToken() (accessToken string, newRefreshToken string, err error) {
@@ -106,7 +119,8 @@ func refreshAccessToken() (accessToken string, newRefreshToken string, err error
 
 func saveToken(token string) {
 	refreshToken = token
-	os.WriteFile("refresh_token.txt", []byte(token), 0600)
+	path := filepath.Join(config.DataDir, "refresh_token.txt")
+	os.WriteFile(path, []byte(token), 0600)
 }
 
 func createSession(accessToken string) (sessionToken string, identityToken string, err error) {
@@ -305,4 +319,38 @@ func fetchProfileUUID(accessToken string) (string, error) {
 		return result.Profiles[0].UUID, nil
 	}
 	return "", fmt.Errorf("no profiles found")
+}
+
+func loadConfig() Config {
+	cfg := Config{
+		Port:    "3000",
+		DataDir: ".",
+	}
+
+	// Load from file if exists
+	if data, err := os.ReadFile("config.json"); err == nil {
+		json.Unmarshal(data, &cfg)
+	}
+
+	// Env vars override
+	if p := os.Getenv("PORT"); p != "" {
+		cfg.Port = p
+	}
+	if d := os.Getenv("DATA_DIR"); d != "" {
+		cfg.DataDir = d
+	}
+
+	// CLI flags override everything
+	port := flag.String("port", "", "HTTP port")
+	dataDir := flag.String("data-dir", "", "Directory for data files")
+	flag.Parse()
+
+	if *port != "" {
+		cfg.Port = *port
+	}
+	if *dataDir != "" {
+		cfg.DataDir = *dataDir
+	}
+
+	return cfg
 }
