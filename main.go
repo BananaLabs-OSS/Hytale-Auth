@@ -8,27 +8,37 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
 )
 
 var refreshToken string
 var profileUUID string
+var setupMode bool
+var deviceURL string
+var deviceCode string
+var userCode string
 
 func main() {
-	refreshToken = loadToken()
-	if refreshToken == "" {
-		fmt.Println("ERROR: No refresh token found")
-		return
-	}
-	fmt.Println("Token loaded, length:", len(refreshToken))
+	profileUUID = loadUUID()
 
-	profileUUID = os.Getenv("HYTALE_PROFILE_UUID")
-	if profileUUID == "" {
-		fmt.Println("ERROR: No profile UUID found")
-		return
+	refreshToken = loadToken()
+	if refreshToken != "" {
+		fmt.Println("Verifying stored token...")
+		_, newRefresh, err := refreshAccessToken()
+		if err == nil && newRefresh != "" {
+			saveToken(newRefresh)
+			fmt.Println("  Token valid")
+		} else {
+			fmt.Println(" ️  Token invalid:", err)
+			startDeviceFlow()
+		}
+	} else {
+		startDeviceFlow()
 	}
 
 	http.HandleFunc("/tokens", tokensHandler)
 	http.HandleFunc("/health", healthHandler)
+	http.HandleFunc("/", setupHandler)
 	http.ListenAndServe(":3002", nil)
 }
 
@@ -45,6 +55,24 @@ func loadToken() string {
 		}
 	}
 	return os.Getenv("HYTALE_REFRESH_TOKEN")
+}
+
+func loadUUID() string {
+	if data, err := os.ReadFile("profile_uuid.txt"); err == nil {
+		// Strip BOM if present
+		if len(data) >= 3 && data[0] == 0xef && data[1] == 0xbb && data[2] == 0xbf {
+			data = data[3:]
+		}
+		uuid := strings.TrimSpace(string(data))
+		if uuid != "" {
+			return uuid
+		}
+	}
+	return os.Getenv("HYTALE_PROFILE_UUID")
+}
+
+func saveUUID(uuid string) {
+	os.WriteFile("profile_uuid.txt", []byte(uuid), 0600)
 }
 
 func refreshAccessToken() (accessToken string, newRefreshToken string, err error) {
@@ -127,12 +155,19 @@ func createSession(accessToken string) (sessionToken string, identityToken strin
 }
 
 func tokensHandler(w http.ResponseWriter, r *http.Request) {
+	if setupMode {
+		http.Error(w, "Not authorized yet. Visit / for setup.", 503)
+		return
+	}
+
 	// Get access token
 	accessToken, newRefresh, err := refreshAccessToken()
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
+
+	fmt.Println("Full access token:", accessToken)
 
 	// Save rotated refresh token
 	saveToken(newRefresh)
@@ -151,4 +186,123 @@ func tokensHandler(w http.ResponseWriter, r *http.Request) {
 			"HYTALE_SERVER_IDENTITY_TOKEN": identityToken,
 		},
 	})
+}
+
+func setupHandler(w http.ResponseWriter, r *http.Request) {
+	if setupMode {
+		fmt.Fprintf(w, "Status: Needs Authorization\nURL: %s\nCode: %s\n", deviceURL, userCode)
+		return
+	}
+	fmt.Fprintf(w, "Status: Ready\n")
+}
+
+func startDeviceFlow() {
+	resp, err := http.PostForm("https://oauth.accounts.hytale.com/oauth2/device/auth",
+		url.Values{
+			"client_id": {"hytale-server"},
+			"scope":     {"openid offline auth:server"},
+		})
+	if err != nil {
+		fmt.Println("Device flow error:", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		DeviceCode      string `json:"device_code"`
+		UserCode        string `json:"user_code"`
+		VerificationURI string `json:"verification_uri_complete"`
+		Interval        int    `json:"interval"`
+	}
+	json.NewDecoder(resp.Body).Decode(&result)
+
+	deviceCode = result.DeviceCode
+	userCode = result.UserCode
+	deviceURL = result.VerificationURI
+	setupMode = true
+
+	fmt.Println("Authorization required")
+	fmt.Printf("   Go to: %s\n", deviceURL)
+	fmt.Printf("   Code:  %s\n", userCode)
+
+	go pollForToken(result.Interval)
+}
+
+func pollForToken(interval int) {
+	if interval < 5 {
+		interval = 5
+	}
+
+	for setupMode {
+		time.Sleep(time.Duration(interval) * time.Second)
+
+		resp, err := http.PostForm("https://oauth.accounts.hytale.com/oauth2/token",
+			url.Values{
+				"client_id":   {"hytale-server"},
+				"grant_type":  {"urn:ietf:params:oauth:grant-type:device_code"},
+				"device_code": {deviceCode},
+			})
+		if err != nil {
+			continue
+		}
+
+		var result struct {
+			AccessToken  string `json:"access_token"`
+			RefreshToken string `json:"refresh_token"`
+			Error        string `json:"error"`
+		}
+		json.NewDecoder(resp.Body).Decode(&result)
+		resp.Body.Close()
+
+		if result.Error == "authorization_pending" {
+			continue
+		}
+		if result.Error != "" {
+			fmt.Println("Auth error:", result.Error)
+			continue
+		}
+
+		if result.RefreshToken != "" {
+			saveToken(result.RefreshToken)
+			refreshToken = result.RefreshToken
+
+			// Fetch profile UUID from API
+			if result.AccessToken != "" {
+				uuid, err := fetchProfileUUID(result.AccessToken)
+				if err == nil {
+					profileUUID = uuid
+					saveUUID(profileUUID)
+					fmt.Println("Profile UUID:", profileUUID)
+				} else {
+					fmt.Println("Failed to fetch profile:", err)
+				}
+			}
+
+			setupMode = false
+			fmt.Println("Authorized!")
+		}
+	}
+}
+
+func fetchProfileUUID(accessToken string) (string, error) {
+	req, _ := http.NewRequest("GET", "https://account-data.hytale.com/my-account/get-profiles", nil)
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Profiles []struct {
+			UUID string `json:"uuid"`
+		} `json:"profiles"`
+	}
+	json.NewDecoder(resp.Body).Decode(&result)
+
+	if len(result.Profiles) > 0 {
+		return result.Profiles[0].UUID, nil
+	}
+	return "", fmt.Errorf("no profiles found")
 }
