@@ -10,5 +10,5 @@ FROM alpine:3.19
 RUN apk add --no-cache ca-certificates
 WORKDIR /app
 COPY --from=builder /build/hytale-auth .
-EXPOSE 3000
+EXPOSE 8081
 CMD ["./hytale-auth"]

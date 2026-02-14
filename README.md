@@ -9,6 +9,7 @@ From [BananaLabs OSS](https://github.com/bananalabs-oss).
 Hytale-Auth handles OAuth flow with Hytale's session service to generate server identity and session tokens. Used as a pre-start hook by Bananagine.
 
 ## Quick Start
+
 ```bash
 go run ./main.go
 ```
@@ -17,13 +18,14 @@ On first run, visit the displayed URL to authorize. Tokens are saved automatical
 
 ## API Reference
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `GET` | `/` | Authorization status |
-| `GET` | `/tokens` | Generate fresh server tokens |
-| `GET` | `/health` | Health check |
+| Method | Endpoint  | Description                  |
+| ------ | --------- | ---------------------------- |
+| `GET`  | `/`       | Authorization status         |
+| `GET`  | `/tokens` | Generate fresh server tokens |
+| `GET`  | `/health` | Health check                 |
 
 **GET /tokens Response:**
+
 ```json
 {
   "env": {
@@ -37,37 +39,40 @@ On first run, visit the displayed URL to authorize. Tokens are saved automatical
 
 Priority: CLI flags > environment variables > config file > defaults
 
-| Setting | Flag | Env Var | Default |
-|---------|------|---------|---------|
-| HTTP port | `--port` | `PORT` | `3002` |
-| Data directory | `--data-dir` | `DATA_DIR` | `.` |
+| Setting        | Flag         | Env Var    | Default |
+| -------------- | ------------ | ---------- | ------- |
+| HTTP port      | `--port`     | `PORT`     | `8081`  |
+| Data directory | `--data-dir` | `DATA_DIR` | `.`     |
 
 **config.json (optional):**
+
 ```json
 {
-  "port": "3002",
+  "port": "8081",
   "data_dir": "/data"
 }
 ```
 
 **Examples:**
+
 ```bash
 # Defaults
 ./hytale-auth
 
 # CLI flags
-./hytale-auth --port 8080 --data-dir ./auth-data
+./hytale-auth --port 8081 --data-dir ./auth-data
 
 # Environment variables
-PORT=8080 DATA_DIR=/data ./hytale-auth
+PORT=8081 DATA_DIR=/data ./hytale-auth
 ```
 
 ## Docker
+
 ```yaml
 hytale-auth:
   image: ghcr.io/bananalabs-oss/hytale-auth:latest
   ports:
-    - "3002:3002"
+    - "8081:8081"
   volumes:
     - ./hytale-auth-data:/data
   environment:
@@ -75,8 +80,6 @@ hytale-auth:
 ```
 
 First run: check logs for authorization URL, approve in browser. Restarts work automatically.
-
-
 
 ## Token Flow
 
@@ -92,3 +95,4 @@ First run: check logs for authorization URL, approve in browser. Restarts work a
 ## License
 
 MIT
+

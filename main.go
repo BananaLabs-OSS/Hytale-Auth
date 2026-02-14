@@ -13,12 +13,14 @@ import (
 	"time"
 )
 
-var refreshToken string
-var profileUUID string
-var setupMode bool
-var deviceURL string
-var deviceCode string
-var userCode string
+var (
+	refreshToken string
+	profileUUID  string
+	setupMode    bool
+	deviceURL    string
+	deviceCode   string
+	userCode     string
+)
 
 var config Config
 
@@ -181,8 +183,6 @@ func tokensHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fmt.Println("Full access token:", accessToken)
-
 	// Save rotated refresh token
 	saveToken(newRefresh)
 
@@ -323,7 +323,7 @@ func fetchProfileUUID(accessToken string) (string, error) {
 
 func loadConfig() Config {
 	cfg := Config{
-		Port:    "3000",
+		Port:    "8081",
 		DataDir: ".",
 	}
 
