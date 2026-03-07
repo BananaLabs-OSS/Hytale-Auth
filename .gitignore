@@ -1,4 +1,5 @@
 .idea/ 
 *.tar 
-hytale-auth 
+hytale-auth
+hytale-auth.exe
 config.json 

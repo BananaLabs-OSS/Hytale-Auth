@@ -105,14 +105,24 @@ func refreshAccessToken() (accessToken string, newRefreshToken string, err error
 
 	fmt.Println("OAuth status:", resp.StatusCode)
 
-	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		respBody, _ := io.ReadAll(resp.Body)
+		return "", "", fmt.Errorf("oauth returned %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to read oauth response: %w", err)
+	}
 	fmt.Println("OAuth response received, parsing tokens...")
 
 	var result struct {
 		AccessToken  string `json:"access_token"`
 		RefreshToken string `json:"refresh_token"`
 	}
-	json.Unmarshal(respBody, &result)
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return "", "", fmt.Errorf("failed to parse oauth response: %w", err)
+	}
 
 	fmt.Printf("Parsed access token length: %d\n", len(result.AccessToken))
 
@@ -155,7 +165,10 @@ func createSession(accessToken string) (sessionToken string, identityToken strin
 		return "", "", fmt.Errorf("session failed: %d - %s", resp.StatusCode, string(respBody))
 	}
 
-	respBody, _ := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to read session response: %w", err)
+	}
 
 	// Parse response
 	var result struct {
@@ -163,7 +176,9 @@ func createSession(accessToken string) (sessionToken string, identityToken strin
 		IdentityToken string `json:"identityToken"`
 		ExpiresAt     string `json:"expiresAt"`
 	}
-	json.Unmarshal(respBody, &result)
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return "", "", fmt.Errorf("failed to parse session response: %w", err)
+	}
 
 	fmt.Printf("Session created, expires: %s\n", result.ExpiresAt)
 
@@ -228,7 +243,10 @@ func startDeviceFlow() {
 		VerificationURI string `json:"verification_uri_complete"`
 		Interval        int    `json:"interval"`
 	}
-	json.NewDecoder(resp.Body).Decode(&result)
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		fmt.Println("Device flow decode error:", err)
+		return
+	}
 
 	deviceCode = result.DeviceCode
 	userCode = result.UserCode
@@ -265,7 +283,10 @@ func pollForToken(interval int) {
 			RefreshToken string `json:"refresh_token"`
 			Error        string `json:"error"`
 		}
-		json.NewDecoder(resp.Body).Decode(&result)
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			resp.Body.Close()
+			continue
+		}
 		resp.Body.Close()
 
 		if result.Error == "authorization_pending" {
@@ -313,7 +334,9 @@ func fetchProfileUUID(accessToken string) (string, error) {
 			UUID string `json:"uuid"`
 		} `json:"profiles"`
 	}
-	json.NewDecoder(resp.Body).Decode(&result)
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", fmt.Errorf("failed to decode profiles: %w", err)
+	}
 
 	if len(result.Profiles) > 0 {
 		return result.Profiles[0].UUID, nil
