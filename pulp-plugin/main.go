@@ -1,28 +1,25 @@
-// Hytale-Auth — Pulp plugin port.
+// Hytale-Auth — Pulp plugin, built on Fiber.
 //
-// Replaces the standalone Go service with a WASM plugin that speaks the
-// Pulp HTTP and storage capabilities. External behavior mirrors the
-// original:
+// Rewrite of the standalone Go service as a WASM plugin. All I/O goes
+// through Pulp capabilities via Fiber's helpers — no raw WASM glue.
 //
-//	GET /tokens — refreshes OAuth and creates a new Hytale session,
+// Routes:
+//
+//	GET /tokens — refreshes OAuth and creates a fresh Hytale session,
 //	              returns identity + session tokens as JSON.
 //	GET /health — returns "ok".
-//	GET /       — reports readiness or, during bootstrap, the device-code
-//	              verification URL and user code.
+//	GET /       — reports readiness or, during bootstrap, the
+//	              device-code verification URL + user code.
 //
-// Storage:
+// Storage (via storage.fs, scoped to this plugin's data dir):
 //
-//	refresh_token.txt — rotated OAuth refresh token, read at boot,
-//	                    rewritten on every successful refresh.
-//	profile_uuid.txt  — Hytale profile UUID used in session creation.
+//	refresh_token.txt — rotated OAuth refresh token.
+//	profile_uuid.txt  — Hytale profile UUID for session creation.
 //
-// Bootstrap: when both files are absent the plugin starts the OAuth
-// device-code flow on pulp_init, holds the verification URL + user code
-// in memory (surfaced via GET /), and polls `/oauth2/token` on the step
-// loop using wall-time from the envelope. Once the user authorizes, the
-// refresh token and profile UUID are written to disk and normal token
-// service begins — same bootstrap UX as the original service, with all
-// I/O going through host capabilities instead of stdlib net/http.
+// Bootstrap: when no refresh token exists, the plugin starts the OAuth
+// device-code flow on init and polls the token endpoint on every step
+// (gated by wall-time). Once the user authorizes, tokens persist and
+// normal service begins.
 //
 // Build:
 //
@@ -30,108 +27,58 @@
 package main
 
 import (
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"net/url"
-	"runtime"
 	"strings"
-	"unsafe"
 
-	"github.com/vmihailenco/msgpack/v5"
+	"github.com/BananaLabs-OSS/Fiber/pulp"
+	pulpgin "github.com/BananaLabs-OSS/Fiber/pulp/gin"
 )
 
 func main() {}
-
-//go:wasmimport pulp http_register
-func hostHTTPRegister(ptr, ln uint32) uint32
-
-//go:wasmimport pulp http_respond
-func hostHTTPRespond(ptr, ln uint32) uint32
-
-//go:wasmimport pulp http_fetch
-func hostHTTPFetch(reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32
-
-//go:wasmimport pulp fs_read
-func hostFSRead(pathPtr, pathLen, dataPtrOut, dataLenOut uint32) uint32
-
-//go:wasmimport pulp fs_write
-func hostFSWrite(pathPtr, pathLen, dataPtr, dataLen uint32) uint32
-
-type stepEvent struct {
-	Kind    string             `msgpack:"kind"`
-	Payload msgpack.RawMessage `msgpack:"payload"`
-}
-
-type httpRequest struct {
-	ID      uint64            `msgpack:"id"`
-	Method  string            `msgpack:"method"`
-	Path    string            `msgpack:"path"`
-	Params  map[string]string `msgpack:"params"`
-	Query   map[string]string `msgpack:"query"`
-	Headers map[string]string `msgpack:"headers"`
-	Body    []byte            `msgpack:"body"`
-}
-
-type httpResponse struct {
-	ID      uint64            `msgpack:"id"`
-	Status  uint32            `msgpack:"status"`
-	Headers map[string]string `msgpack:"headers"`
-	Body    []byte            `msgpack:"body"`
-}
-
-type httpFetchRequest struct {
-	Method  string            `msgpack:"method"`
-	URL     string            `msgpack:"url"`
-	Headers map[string]string `msgpack:"headers"`
-	Body    []byte            `msgpack:"body"`
-}
-
-type httpFetchResponse struct {
-	Status  uint32            `msgpack:"status"`
-	Headers map[string]string `msgpack:"headers"`
-	Body    []byte            `msgpack:"body"`
-}
 
 var (
 	refreshToken string
 	profileUUID  string
 
-	// Device-code bootstrap state, populated when the plugin starts
-	// without a refresh token.
 	setupMode       bool
 	deviceCode      string
 	userCode        string
 	verificationURI string
 	pollIntervalSec uint64 = 5
 	lastPollNanos   uint64
-
 )
 
-//go:wasmexport pulp_alloc
-func pulpAlloc(size uint32) uint32 {
-	if size == 0 {
-		return 0
+func init() {
+	pulp.OnInit(bootstrap)
+
+	r := pulpgin.New()
+	r.GET("/health", health)
+	r.GET("/tokens", tokens)
+	r.GET("/", status)
+
+	// Declare routes but compose our own OnStep so polling runs
+	// alongside HTTP dispatch.
+	if err := r.RegisterRoutes(); err != nil {
+		fmt.Printf("[hytale-auth] route register failed: %v\n", err)
+		return
 	}
-	buf := make([]byte, size)
-	return uint32(uintptr(unsafe.Pointer(&buf[0])))
+	pulp.OnStep(func(ev pulp.StepEvent) error {
+		if setupMode {
+			pollDeviceIfDue(ev.WallTime)
+		}
+		return r.Dispatch(ev)
+	})
 }
 
-//go:wasmexport pulp_free
-func pulpFree(ptr, size uint32) {
-	_ = ptr
-	_ = size
-}
-
-//go:wasmexport pulp_init
-func pulpInit(cfgPtr, cfgLen uint32) int32 {
-	_ = cfgPtr
-	_ = cfgLen
-
-	if data, ok := fsRead("refresh_token.txt"); ok {
+// bootstrap runs during pulp_init. Loads any persisted credentials and
+// starts the device-code flow if missing.
+func bootstrap(_ []byte) error {
+	if data, err := pulp.FS.Read("refresh_token.txt"); err == nil {
 		refreshToken = strings.TrimSpace(string(data))
 	}
-	if data, ok := fsRead("profile_uuid.txt"); ok {
+	if data, err := pulp.FS.Read("profile_uuid.txt"); err == nil {
 		cleaned := data
 		if len(cleaned) >= 3 && cleaned[0] == 0xef && cleaned[1] == 0xbb && cleaned[2] == 0xbf {
 			cleaned = cleaned[3:]
@@ -141,132 +88,73 @@ func pulpInit(cfgPtr, cfgLen uint32) int32 {
 
 	if refreshToken == "" {
 		if err := startDeviceFlow(); err != nil {
-			fmt.Printf("[hytale-auth] startDeviceFlow error: %v\n", err)
-			return 200
+			return fmt.Errorf("start device flow: %w", err)
 		}
 		fmt.Printf("[hytale-auth] authorize at: %s (code: %s)\n", verificationURI, userCode)
 	}
-
-	for _, r := range [][2]string{
-		{"GET", "/tokens"},
-		{"GET", "/health"},
-		{"GET", "/"},
-	} {
-		if code := registerRoute(r[0], r[1]); code != 0 {
-			return int32(100 + code)
-		}
-	}
-	return 0
+	return nil
 }
 
-//go:wasmexport pulp_step
-func pulpStep(inputPtr, inputLen uint32) int32 {
-	if inputLen < 20 {
-		return 1
-	}
-	raw := unsafe.Slice((*byte)(unsafe.Pointer(uintptr(inputPtr))), inputLen)
-	wallTime := binary.LittleEndian.Uint64(raw[8:16])
-	payloadLen := binary.LittleEndian.Uint32(raw[16:20])
+// ---- HTTP handlers (Gin-style) -----------------------------------------
 
+func health(c *pulpgin.Context) {
+	c.String(200, "ok")
+}
+
+func status(c *pulpgin.Context) {
 	if setupMode {
-		pollDeviceIfDue(wallTime)
-	}
-
-	if payloadLen == 0 {
-		return 0
-	}
-	payload := raw[20 : 20+payloadLen]
-
-	var ev stepEvent
-	if err := msgpack.Unmarshal(payload, &ev); err != nil {
-		return 2
-	}
-	if ev.Kind != "http.request" {
-		return 0
-	}
-
-	var req httpRequest
-	if err := msgpack.Unmarshal(ev.Payload, &req); err != nil {
-		return 3
-	}
-	resp := route(req)
-	return respond(resp)
-}
-
-//go:wasmexport pulp_shutdown
-func pulpShutdown() int32 {
-	return 0
-}
-
-func route(req httpRequest) httpResponse {
-	switch req.Path {
-	case "/health":
-		return textResponse(req.ID, 200, "ok")
-	case "/":
-		if setupMode {
-			return textResponse(req.ID, 200,
-				fmt.Sprintf("Status: Needs Authorization\nURL: %s\nCode: %s\n", verificationURI, userCode))
-		}
-		if refreshToken == "" || profileUUID == "" {
-			return textResponse(req.ID, 503, "Status: Not Ready (missing credentials)")
-		}
-		return textResponse(req.ID, 200, "Status: Ready\n")
-	case "/tokens":
-		return handleTokens(req)
-	default:
-		return textResponse(req.ID, 404, "not found")
-	}
-}
-
-func handleTokens(req httpRequest) httpResponse {
-	if setupMode {
-		return textResponse(req.ID, 503, "Not authorized yet. Visit / for setup.")
+		c.String(200, "Status: Needs Authorization\nURL: %s\nCode: %s\n", verificationURI, userCode)
+		return
 	}
 	if refreshToken == "" || profileUUID == "" {
-		return textResponse(req.ID, 503, "not authorized — missing refresh_token.txt or profile_uuid.txt")
+		c.String(503, "Status: Not Ready (missing credentials)")
+		return
+	}
+	c.String(200, "Status: Ready\n")
+}
+
+func tokens(c *pulpgin.Context) {
+	if setupMode {
+		c.String(503, "Not authorized yet. Visit / for setup.")
+		return
+	}
+	if refreshToken == "" || profileUUID == "" {
+		c.String(503, "not authorized — missing refresh_token.txt or profile_uuid.txt")
+		return
 	}
 
 	accessToken, newRefresh, err := oauthRefresh(refreshToken)
 	if err != nil {
-		return textResponse(req.ID, 500, "oauth refresh: "+err.Error())
+		c.String(500, "oauth refresh: %v", err)
+		return
 	}
 	if newRefresh != "" && newRefresh != refreshToken {
 		refreshToken = newRefresh
-		_ = fsWrite("refresh_token.txt", []byte(newRefresh))
+		_ = pulp.FS.Write("refresh_token.txt", []byte(newRefresh))
 	}
 
 	sessionToken, identityToken, err := createSession(accessToken, profileUUID)
 	if err != nil {
-		return textResponse(req.ID, 500, "session create: "+err.Error())
+		c.String(500, "session create: %v", err)
+		return
 	}
 
-	body, err := json.Marshal(map[string]any{
+	c.JSON(200, pulpgin.H{
 		"env": map[string]string{
 			"HYTALE_SERVER_SESSION_TOKEN":  sessionToken,
 			"HYTALE_SERVER_IDENTITY_TOKEN": identityToken,
 		},
 	})
-	if err != nil {
-		return textResponse(req.ID, 500, "marshal response: "+err.Error())
-	}
-	return httpResponse{
-		ID:      req.ID,
-		Status:  200,
-		Headers: map[string]string{"Content-Type": "application/json"},
-		Body:    body,
-	}
 }
 
-// startDeviceFlow initiates the OAuth device-code grant. On success it
-// populates the verification URL, user code, and device code so the
-// operator can authorize at https://{uri}. Poll cadence is set from the
-// server's recommended interval (min 5s).
+// ---- OAuth flow --------------------------------------------------------
+
 func startDeviceFlow() error {
 	form := url.Values{
 		"client_id": {"hytale-server"},
 		"scope":     {"openid offline auth:server"},
 	}
-	resp, err := fetch(httpFetchRequest{
+	resp, err := pulp.HTTP.Fetch(pulp.HTTPFetchRequest{
 		Method:  "POST",
 		URL:     "https://oauth.accounts.hytale.com/oauth2/device/auth",
 		Headers: map[string]string{"Content-Type": "application/x-www-form-urlencoded"},
@@ -297,9 +185,6 @@ func startDeviceFlow() error {
 	return nil
 }
 
-// pollDeviceIfDue advances the device-code flow when the next poll
-// interval has elapsed. Runs from pulp_step using the envelope's wall
-// time — no host goroutine, no timer primitives required.
 func pollDeviceIfDue(wallNanos uint64) {
 	if lastPollNanos != 0 && wallNanos-lastPollNanos < pollIntervalSec*1_000_000_000 {
 		return
@@ -311,7 +196,7 @@ func pollDeviceIfDue(wallNanos uint64) {
 		"grant_type":  {"urn:ietf:params:oauth:grant-type:device_code"},
 		"device_code": {deviceCode},
 	}
-	resp, err := fetch(httpFetchRequest{
+	resp, err := pulp.HTTP.Fetch(pulp.HTTPFetchRequest{
 		Method:  "POST",
 		URL:     "https://oauth.accounts.hytale.com/oauth2/token",
 		Headers: map[string]string{"Content-Type": "application/x-www-form-urlencoded"},
@@ -341,11 +226,11 @@ func pollDeviceIfDue(wallNanos uint64) {
 	}
 
 	refreshToken = parsed.RefreshToken
-	_ = fsWrite("refresh_token.txt", []byte(parsed.RefreshToken))
+	_ = pulp.FS.Write("refresh_token.txt", []byte(parsed.RefreshToken))
 
 	if uuid, err := fetchProfileUUID(parsed.AccessToken); err == nil && uuid != "" {
 		profileUUID = uuid
-		_ = fsWrite("profile_uuid.txt", []byte(uuid))
+		_ = pulp.FS.Write("profile_uuid.txt", []byte(uuid))
 	}
 	setupMode = false
 	deviceCode = ""
@@ -354,41 +239,13 @@ func pollDeviceIfDue(wallNanos uint64) {
 	fmt.Printf("[hytale-auth] authorized, tokens saved\n")
 }
 
-func fetchProfileUUID(accessToken string) (string, error) {
-	resp, err := fetch(httpFetchRequest{
-		Method: "GET",
-		URL:    "https://account-data.hytale.com/my-account/get-profiles",
-		Headers: map[string]string{
-			"Authorization": "Bearer " + accessToken,
-		},
-	})
-	if err != nil {
-		return "", err
-	}
-	if resp.Status != 200 {
-		return "", fmt.Errorf("get-profiles status %d: %s", resp.Status, resp.Body)
-	}
-	var parsed struct {
-		Profiles []struct {
-			UUID string `json:"uuid"`
-		} `json:"profiles"`
-	}
-	if err := json.Unmarshal(resp.Body, &parsed); err != nil {
-		return "", fmt.Errorf("decode profiles: %w", err)
-	}
-	if len(parsed.Profiles) == 0 {
-		return "", fmt.Errorf("no profiles in response")
-	}
-	return parsed.Profiles[0].UUID, nil
-}
-
 func oauthRefresh(token string) (access, newRefresh string, err error) {
 	form := url.Values{
 		"client_id":     {"hytale-server"},
 		"grant_type":    {"refresh_token"},
 		"refresh_token": {token},
 	}
-	resp, err := fetch(httpFetchRequest{
+	resp, err := pulp.HTTP.Fetch(pulp.HTTPFetchRequest{
 		Method:  "POST",
 		URL:     "https://oauth.accounts.hytale.com/oauth2/token",
 		Headers: map[string]string{"Content-Type": "application/x-www-form-urlencoded"},
@@ -412,7 +269,7 @@ func oauthRefresh(token string) (access, newRefresh string, err error) {
 
 func createSession(accessToken, uuid string) (sessionToken, identityToken string, err error) {
 	body := fmt.Sprintf(`{"uuid": %q}`, uuid)
-	resp, err := fetch(httpFetchRequest{
+	resp, err := pulp.HTTP.Fetch(pulp.HTTPFetchRequest{
 		Method: "POST",
 		URL:    "https://sessions.hytale.com/game-session/new",
 		Headers: map[string]string{
@@ -437,107 +294,30 @@ func createSession(accessToken, uuid string) (sessionToken, identityToken string
 	return parsed.SessionToken, parsed.IdentityToken, nil
 }
 
-func fetch(req httpFetchRequest) (httpFetchResponse, error) {
-	reqBytes, err := msgpack.Marshal(req)
+func fetchProfileUUID(accessToken string) (string, error) {
+	resp, err := pulp.HTTP.Fetch(pulp.HTTPFetchRequest{
+		Method: "GET",
+		URL:    "https://account-data.hytale.com/my-account/get-profiles",
+		Headers: map[string]string{
+			"Authorization": "Bearer " + accessToken,
+		},
+	})
 	if err != nil {
-		return httpFetchResponse{}, fmt.Errorf("marshal fetch: %w", err)
+		return "", err
 	}
-
-	var respPtr, respLen uint32
-	code := hostHTTPFetch(
-		uint32(uintptr(unsafe.Pointer(&reqBytes[0]))),
-		uint32(len(reqBytes)),
-		uint32(uintptr(unsafe.Pointer(&respPtr))),
-		uint32(uintptr(unsafe.Pointer(&respLen))),
-	)
-	runtime.KeepAlive(reqBytes)
-	if code != 0 {
-		return httpFetchResponse{}, fmt.Errorf("http_fetch host code %d", code)
+	if resp.Status != 200 {
+		return "", fmt.Errorf("get-profiles status %d: %s", resp.Status, resp.Body)
 	}
-	if respLen == 0 {
-		return httpFetchResponse{}, fmt.Errorf("http_fetch returned empty body")
+	var parsed struct {
+		Profiles []struct {
+			UUID string `json:"uuid"`
+		} `json:"profiles"`
 	}
-	respBytes := unsafe.Slice((*byte)(unsafe.Pointer(uintptr(respPtr))), respLen)
-	var resp httpFetchResponse
-	if err := msgpack.Unmarshal(respBytes, &resp); err != nil {
-		return httpFetchResponse{}, fmt.Errorf("decode fetch resp: %w", err)
+	if err := json.Unmarshal(resp.Body, &parsed); err != nil {
+		return "", fmt.Errorf("decode profiles: %w", err)
 	}
-	return resp, nil
-}
-
-func registerRoute(method, path string) uint32 {
-	reg := struct {
-		Method string `msgpack:"method"`
-		Path   string `msgpack:"path"`
-	}{Method: method, Path: path}
-	data, err := msgpack.Marshal(reg)
-	if err != nil || len(data) == 0 {
-		return 99
+	if len(parsed.Profiles) == 0 {
+		return "", fmt.Errorf("no profiles in response")
 	}
-	code := hostHTTPRegister(uint32(uintptr(unsafe.Pointer(&data[0]))), uint32(len(data)))
-	runtime.KeepAlive(data)
-	return code
-}
-
-func respond(resp httpResponse) int32 {
-	data, err := msgpack.Marshal(resp)
-	if err != nil {
-		return 4
-	}
-	code := hostHTTPRespond(uint32(uintptr(unsafe.Pointer(&data[0]))), uint32(len(data)))
-	runtime.KeepAlive(data)
-	if code != 0 {
-		return int32(300 + code)
-	}
-	return 0
-}
-
-func textResponse(id uint64, status uint32, body string) httpResponse {
-	return httpResponse{
-		ID:      id,
-		Status:  status,
-		Headers: map[string]string{"Content-Type": "text/plain; charset=utf-8"},
-		Body:    []byte(body),
-	}
-}
-
-func fsRead(path string) ([]byte, bool) {
-	pathBytes := []byte(path)
-	var dataPtr, dataLen uint32
-	code := hostFSRead(
-		uint32(uintptr(unsafe.Pointer(&pathBytes[0]))),
-		uint32(len(pathBytes)),
-		uint32(uintptr(unsafe.Pointer(&dataPtr))),
-		uint32(uintptr(unsafe.Pointer(&dataLen))),
-	)
-	runtime.KeepAlive(pathBytes)
-	if code != 0 {
-		return nil, false
-	}
-	if dataLen == 0 {
-		return nil, true
-	}
-	data := unsafe.Slice((*byte)(unsafe.Pointer(uintptr(dataPtr))), dataLen)
-	out := make([]byte, dataLen)
-	copy(out, data)
-	return out, true
-}
-
-func fsWrite(path string, data []byte) bool {
-	pathBytes := []byte(path)
-	var dataPtr uint32
-	var dataLen uint32
-	if len(data) > 0 {
-		dataPtr = uint32(uintptr(unsafe.Pointer(&data[0])))
-		dataLen = uint32(len(data))
-	}
-	code := hostFSWrite(
-		uint32(uintptr(unsafe.Pointer(&pathBytes[0]))),
-		uint32(len(pathBytes)),
-		dataPtr,
-		dataLen,
-	)
-	runtime.KeepAlive(pathBytes)
-	runtime.KeepAlive(data)
-	return code == 0
+	return parsed.Profiles[0].UUID, nil
 }
