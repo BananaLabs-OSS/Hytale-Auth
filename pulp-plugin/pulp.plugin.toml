@@ -1,0 +1,9 @@
+name = "hytale-auth"
+version = "0.1.0"
+wasm = "hytale-auth.wasm"
+
+capabilities = [
+    "transport.http.inbound",
+    "transport.http.outbound",
+    "storage.fs",
+]
