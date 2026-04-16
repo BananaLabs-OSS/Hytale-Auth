@@ -2,4 +2,6 @@
 *.tar 
 hytale-auth
 hytale-auth.exe
-config.json 
+config.json
+pulp-plugin/*.wasm
+pulp-plugin/data/
