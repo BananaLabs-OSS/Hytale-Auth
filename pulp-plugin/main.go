@@ -1,12 +1,14 @@
 // Hytale-Auth — Pulp plugin port.
 //
 // Replaces the standalone Go service with a WASM plugin that speaks the
-// Pulp HTTP and storage capabilities. Identical external behavior:
+// Pulp HTTP and storage capabilities. External behavior mirrors the
+// original:
 //
 //	GET /tokens — refreshes OAuth and creates a new Hytale session,
 //	              returns identity + session tokens as JSON.
 //	GET /health — returns "ok".
-//	GET /       — reports readiness / authorization status.
+//	GET /       — reports readiness or, during bootstrap, the device-code
+//	              verification URL and user code.
 //
 // Storage:
 //
@@ -14,8 +16,13 @@
 //	                    rewritten on every successful refresh.
 //	profile_uuid.txt  — Hytale profile UUID used in session creation.
 //
-// Device-code bootstrap (operator-facing setup flow) is not ported in
-// this first cut; provision the two files before running the plugin.
+// Bootstrap: when both files are absent the plugin starts the OAuth
+// device-code flow on pulp_init, holds the verification URL + user code
+// in memory (surfaced via GET /), and polls `/oauth2/token` on the step
+// loop using wall-time from the envelope. Once the user authorizes, the
+// refresh token and profile UUID are written to disk and normal token
+// service begins — same bootstrap UX as the original service, with all
+// I/O going through host capabilities instead of stdlib net/http.
 //
 // Build:
 //
@@ -27,6 +34,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"runtime"
 	"strings"
 	"unsafe"
 
@@ -89,7 +97,15 @@ var (
 	refreshToken string
 	profileUUID  string
 
-	pinned [][]byte
+	// Device-code bootstrap state, populated when the plugin starts
+	// without a refresh token.
+	setupMode       bool
+	deviceCode      string
+	userCode        string
+	verificationURI string
+	pollIntervalSec uint64 = 5
+	lastPollNanos   uint64
+
 )
 
 //go:wasmexport pulp_alloc
@@ -98,7 +114,6 @@ func pulpAlloc(size uint32) uint32 {
 		return 0
 	}
 	buf := make([]byte, size)
-	pinned = append(pinned, buf)
 	return uint32(uintptr(unsafe.Pointer(&buf[0])))
 }
 
@@ -124,6 +139,12 @@ func pulpInit(cfgPtr, cfgLen uint32) int32 {
 		profileUUID = strings.TrimSpace(string(cleaned))
 	}
 
+	if refreshToken == "" {
+		if err := startDeviceFlow(); err != nil {
+			return 200
+		}
+	}
+
 	for _, r := range [][2]string{
 		{"GET", "/tokens"},
 		{"GET", "/health"},
@@ -142,7 +163,13 @@ func pulpStep(inputPtr, inputLen uint32) int32 {
 		return 1
 	}
 	raw := unsafe.Slice((*byte)(unsafe.Pointer(uintptr(inputPtr))), inputLen)
+	wallTime := binary.LittleEndian.Uint64(raw[8:16])
 	payloadLen := binary.LittleEndian.Uint32(raw[16:20])
+
+	if setupMode {
+		pollDeviceIfDue(wallTime)
+	}
+
 	if payloadLen == 0 {
 		return 0
 	}
@@ -166,7 +193,6 @@ func pulpStep(inputPtr, inputLen uint32) int32 {
 
 //go:wasmexport pulp_shutdown
 func pulpShutdown() int32 {
-	pinned = nil
 	return 0
 }
 
@@ -175,10 +201,14 @@ func route(req httpRequest) httpResponse {
 	case "/health":
 		return textResponse(req.ID, 200, "ok")
 	case "/":
-		if refreshToken == "" || profileUUID == "" {
-			return textResponse(req.ID, 503, "Status: Needs Bootstrap (refresh_token.txt + profile_uuid.txt)")
+		if setupMode {
+			return textResponse(req.ID, 200,
+				fmt.Sprintf("Status: Needs Authorization\nURL: %s\nCode: %s\n", verificationURI, userCode))
 		}
-		return textResponse(req.ID, 200, "Status: Ready")
+		if refreshToken == "" || profileUUID == "" {
+			return textResponse(req.ID, 503, "Status: Not Ready (missing credentials)")
+		}
+		return textResponse(req.ID, 200, "Status: Ready\n")
 	case "/tokens":
 		return handleTokens(req)
 	default:
@@ -187,6 +217,9 @@ func route(req httpRequest) httpResponse {
 }
 
 func handleTokens(req httpRequest) httpResponse {
+	if setupMode {
+		return textResponse(req.ID, 503, "Not authorized yet. Visit / for setup.")
+	}
 	if refreshToken == "" || profileUUID == "" {
 		return textResponse(req.ID, 503, "not authorized — missing refresh_token.txt or profile_uuid.txt")
 	}
@@ -220,6 +253,125 @@ func handleTokens(req httpRequest) httpResponse {
 		Headers: map[string]string{"Content-Type": "application/json"},
 		Body:    body,
 	}
+}
+
+// startDeviceFlow initiates the OAuth device-code grant. On success it
+// populates the verification URL, user code, and device code so the
+// operator can authorize at https://{uri}. Poll cadence is set from the
+// server's recommended interval (min 5s).
+func startDeviceFlow() error {
+	form := url.Values{
+		"client_id": {"hytale-server"},
+		"scope":     {"openid offline auth:server"},
+	}
+	resp, err := fetch(httpFetchRequest{
+		Method:  "POST",
+		URL:     "https://oauth.accounts.hytale.com/oauth2/device/auth",
+		Headers: map[string]string{"Content-Type": "application/x-www-form-urlencoded"},
+		Body:    []byte(form.Encode()),
+	})
+	if err != nil {
+		return fmt.Errorf("device auth: %w", err)
+	}
+	if resp.Status != 200 {
+		return fmt.Errorf("device auth status %d: %s", resp.Status, resp.Body)
+	}
+	var parsed struct {
+		DeviceCode      string `json:"device_code"`
+		UserCode        string `json:"user_code"`
+		VerificationURI string `json:"verification_uri_complete"`
+		Interval        int    `json:"interval"`
+	}
+	if err := json.Unmarshal(resp.Body, &parsed); err != nil {
+		return fmt.Errorf("decode device auth: %w", err)
+	}
+	deviceCode = parsed.DeviceCode
+	userCode = parsed.UserCode
+	verificationURI = parsed.VerificationURI
+	if parsed.Interval >= 5 {
+		pollIntervalSec = uint64(parsed.Interval)
+	}
+	setupMode = true
+	return nil
+}
+
+// pollDeviceIfDue advances the device-code flow when the next poll
+// interval has elapsed. Runs from pulp_step using the envelope's wall
+// time — no host goroutine, no timer primitives required.
+func pollDeviceIfDue(wallNanos uint64) {
+	if lastPollNanos != 0 && wallNanos-lastPollNanos < pollIntervalSec*1_000_000_000 {
+		return
+	}
+	lastPollNanos = wallNanos
+
+	form := url.Values{
+		"client_id":   {"hytale-server"},
+		"grant_type":  {"urn:ietf:params:oauth:grant-type:device_code"},
+		"device_code": {deviceCode},
+	}
+	resp, err := fetch(httpFetchRequest{
+		Method:  "POST",
+		URL:     "https://oauth.accounts.hytale.com/oauth2/token",
+		Headers: map[string]string{"Content-Type": "application/x-www-form-urlencoded"},
+		Body:    []byte(form.Encode()),
+	})
+	if err != nil {
+		return
+	}
+	var parsed struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		Error        string `json:"error"`
+	}
+	if err := json.Unmarshal(resp.Body, &parsed); err != nil {
+		return
+	}
+	if parsed.Error == "authorization_pending" || parsed.Error == "slow_down" {
+		return
+	}
+	if parsed.Error != "" || parsed.RefreshToken == "" {
+		return
+	}
+
+	refreshToken = parsed.RefreshToken
+	_ = fsWrite("refresh_token.txt", []byte(parsed.RefreshToken))
+
+	if uuid, err := fetchProfileUUID(parsed.AccessToken); err == nil && uuid != "" {
+		profileUUID = uuid
+		_ = fsWrite("profile_uuid.txt", []byte(uuid))
+	}
+	setupMode = false
+	deviceCode = ""
+	userCode = ""
+	verificationURI = ""
+}
+
+func fetchProfileUUID(accessToken string) (string, error) {
+	resp, err := fetch(httpFetchRequest{
+		Method: "GET",
+		URL:    "https://account-data.hytale.com/my-account/get-profiles",
+		Headers: map[string]string{
+			"Authorization": "Bearer " + accessToken,
+		},
+	})
+	if err != nil {
+		return "", err
+	}
+	if resp.Status != 200 {
+		return "", fmt.Errorf("get-profiles status %d: %s", resp.Status, resp.Body)
+	}
+	var parsed struct {
+		Profiles []struct {
+			UUID string `json:"uuid"`
+		} `json:"profiles"`
+	}
+	if err := json.Unmarshal(resp.Body, &parsed); err != nil {
+		return "", fmt.Errorf("decode profiles: %w", err)
+	}
+	if len(parsed.Profiles) == 0 {
+		return "", fmt.Errorf("no profiles in response")
+	}
+	return parsed.Profiles[0].UUID, nil
 }
 
 func oauthRefresh(token string) (access, newRefresh string, err error) {
@@ -282,7 +434,6 @@ func fetch(req httpFetchRequest) (httpFetchResponse, error) {
 	if err != nil {
 		return httpFetchResponse{}, fmt.Errorf("marshal fetch: %w", err)
 	}
-	pinned = append(pinned, reqBytes)
 
 	var respPtr, respLen uint32
 	code := hostHTTPFetch(
@@ -291,6 +442,7 @@ func fetch(req httpFetchRequest) (httpFetchResponse, error) {
 		uint32(uintptr(unsafe.Pointer(&respPtr))),
 		uint32(uintptr(unsafe.Pointer(&respLen))),
 	)
+	runtime.KeepAlive(reqBytes)
 	if code != 0 {
 		return httpFetchResponse{}, fmt.Errorf("http_fetch host code %d", code)
 	}
@@ -314,8 +466,9 @@ func registerRoute(method, path string) uint32 {
 	if err != nil || len(data) == 0 {
 		return 99
 	}
-	pinned = append(pinned, data)
-	return hostHTTPRegister(uint32(uintptr(unsafe.Pointer(&data[0]))), uint32(len(data)))
+	code := hostHTTPRegister(uint32(uintptr(unsafe.Pointer(&data[0]))), uint32(len(data)))
+	runtime.KeepAlive(data)
+	return code
 }
 
 func respond(resp httpResponse) int32 {
@@ -323,8 +476,9 @@ func respond(resp httpResponse) int32 {
 	if err != nil {
 		return 4
 	}
-	pinned = append(pinned, data)
-	if code := hostHTTPRespond(uint32(uintptr(unsafe.Pointer(&data[0]))), uint32(len(data))); code != 0 {
+	code := hostHTTPRespond(uint32(uintptr(unsafe.Pointer(&data[0]))), uint32(len(data)))
+	runtime.KeepAlive(data)
+	if code != 0 {
 		return int32(300 + code)
 	}
 	return 0
@@ -341,7 +495,6 @@ func textResponse(id uint64, status uint32, body string) httpResponse {
 
 func fsRead(path string) ([]byte, bool) {
 	pathBytes := []byte(path)
-	pinned = append(pinned, pathBytes)
 	var dataPtr, dataLen uint32
 	code := hostFSRead(
 		uint32(uintptr(unsafe.Pointer(&pathBytes[0]))),
@@ -349,6 +502,7 @@ func fsRead(path string) ([]byte, bool) {
 		uint32(uintptr(unsafe.Pointer(&dataPtr))),
 		uint32(uintptr(unsafe.Pointer(&dataLen))),
 	)
+	runtime.KeepAlive(pathBytes)
 	if code != 0 {
 		return nil, false
 	}
@@ -363,7 +517,6 @@ func fsRead(path string) ([]byte, bool) {
 
 func fsWrite(path string, data []byte) bool {
 	pathBytes := []byte(path)
-	pinned = append(pinned, pathBytes, data)
 	var dataPtr uint32
 	var dataLen uint32
 	if len(data) > 0 {
@@ -376,5 +529,7 @@ func fsWrite(path string, data []byte) bool {
 		dataPtr,
 		dataLen,
 	)
+	runtime.KeepAlive(pathBytes)
+	runtime.KeepAlive(data)
 	return code == 0
 }
