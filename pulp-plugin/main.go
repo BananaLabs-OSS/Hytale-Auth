@@ -141,8 +141,10 @@ func pulpInit(cfgPtr, cfgLen uint32) int32 {
 
 	if refreshToken == "" {
 		if err := startDeviceFlow(); err != nil {
+			fmt.Printf("[hytale-auth] startDeviceFlow error: %v\n", err)
 			return 200
 		}
+		fmt.Printf("[hytale-auth] authorize at: %s (code: %s)\n", verificationURI, userCode)
 	}
 
 	for _, r := range [][2]string{
@@ -318,6 +320,7 @@ func pollDeviceIfDue(wallNanos uint64) {
 	if err != nil {
 		return
 	}
+
 	var parsed struct {
 		AccessToken  string `json:"access_token"`
 		RefreshToken string `json:"refresh_token"`
@@ -329,7 +332,11 @@ func pollDeviceIfDue(wallNanos uint64) {
 	if parsed.Error == "authorization_pending" || parsed.Error == "slow_down" {
 		return
 	}
-	if parsed.Error != "" || parsed.RefreshToken == "" {
+	if parsed.Error != "" {
+		fmt.Printf("[hytale-auth] oauth error: %s\n", parsed.Error)
+		return
+	}
+	if parsed.RefreshToken == "" {
 		return
 	}
 
@@ -344,6 +351,7 @@ func pollDeviceIfDue(wallNanos uint64) {
 	deviceCode = ""
 	userCode = ""
 	verificationURI = ""
+	fmt.Printf("[hytale-auth] authorized, tokens saved\n")
 }
 
 func fetchProfileUUID(accessToken string) (string, error) {
