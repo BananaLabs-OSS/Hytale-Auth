@@ -1,6 +1,6 @@
-// Hytale-Auth — Pulp plugin, built on Fiber.
+// Hytale-Auth — Pulp cell, built on Fiber.
 //
-// Rewrite of the standalone Go service as a WASM plugin. All I/O goes
+// Rewrite of the standalone Go service as a WASM cell. All I/O goes
 // through Pulp capabilities via Fiber's helpers — no raw WASM glue.
 //
 // Routes:
@@ -11,12 +11,12 @@
 //	GET /       — reports readiness or, during bootstrap, the
 //	              device-code verification URL + user code.
 //
-// Storage (via storage.fs, scoped to this plugin's data dir):
+// Storage (via storage.fs, scoped to this cell's data dir):
 //
 //	refresh_token.txt — rotated OAuth refresh token.
 //	profile_uuid.txt  — Hytale profile UUID for session creation.
 //
-// Bootstrap: when no refresh token exists, the plugin starts the OAuth
+// Bootstrap: when no refresh token exists, the cell starts the OAuth
 // device-code flow on init and polls the token endpoint on every step
 // (gated by wall-time). Once the user authorizes, tokens persist and
 // normal service begins.
@@ -29,7 +29,9 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/url"
+	"os"
 	"strings"
 
 	"github.com/BananaLabs-OSS/Fiber/pulp"
@@ -59,14 +61,28 @@ func init() {
 	r.GET("/", status)
 
 	// Declare routes but compose our own OnStep so polling runs
-	// alongside HTTP dispatch.
+	// alongside HTTP dispatch. Note: Pulp's OnStep only fires on
+	// payload-carrying events (HTTP/WS). There is no idle tick, so
+	// device-code polling advances only when HTTP traffic arrives.
+	// This is the established pattern across all Pulp cells (matches
+	// Bananasplit matcher.TickIfDue). In practice the operator will
+	// hit / to see the code, which is enough to drive the poll.
 	if err := r.RegisterRoutes(); err != nil {
-		fmt.Printf("[hytale-auth] route register failed: %v\n", err)
+		// Cell-only — native Hytale-Auth has no equivalent (routes are mux.HandleFunc).
+		log.Printf("route register failed: %v", err)
 		return
 	}
 	pulp.OnStep(func(ev pulp.StepEvent) error {
 		if setupMode {
-			pollDeviceIfDue(ev.WallTime)
+			// Seed lastPollNanos on first observation so the first poll
+			// waits a full interval after device flow start — matches
+			// native pollForToken's `time.Sleep(interval)` BEFORE the
+			// first request, not before subsequent ones.
+			if lastPollNanos == 0 {
+				lastPollNanos = ev.WallTime
+			} else {
+				pollDeviceIfDue(ev.WallTime)
+			}
 		}
 		return r.Dispatch(ev)
 	})
@@ -74,10 +90,24 @@ func init() {
 
 // bootstrap runs during pulp_init. Loads any persisted credentials and
 // starts the device-code flow if missing.
+//
+// Credential resolution ladder (matches native main.go):
+//  1. File in the cell's scoped storage (refresh_token.txt, profile_uuid.txt)
+//  2. Host-forwarded env var (HYTALE_REFRESH_TOKEN, HYTALE_PROFILE_UUID)
+//  3. Device-code flow (interactive authorization)
+//
+// The env-var leg only works if the Pulp host forwards those keys into
+// WASI's env list. The host currently forwards a narrow allowlist; if
+// the keys aren't forwarded, os.Getenv returns "" and we fall through
+// to the device flow — same net behavior as native when env is unset.
 func bootstrap(_ []byte) error {
 	if data, err := pulp.FS.Read("refresh_token.txt"); err == nil {
 		refreshToken = strings.TrimSpace(string(data))
 	}
+	if refreshToken == "" {
+		refreshToken = os.Getenv("HYTALE_REFRESH_TOKEN")
+	}
+
 	if data, err := pulp.FS.Read("profile_uuid.txt"); err == nil {
 		cleaned := data
 		if len(cleaned) >= 3 && cleaned[0] == 0xef && cleaned[1] == 0xbb && cleaned[2] == 0xbf {
@@ -85,12 +115,37 @@ func bootstrap(_ []byte) error {
 		}
 		profileUUID = strings.TrimSpace(string(cleaned))
 	}
+	if profileUUID == "" {
+		profileUUID = os.Getenv("HYTALE_PROFILE_UUID")
+	}
+
+	if refreshToken != "" {
+		// Verify stored token still works. If the refresh call succeeds
+		// and hands back a rotated token, persist it; on failure, fall
+		// through to the device flow so the operator can re-authorize.
+		// Matches native main.go's "Verifying stored token..." block.
+		fmt.Println("Verifying stored token...")
+		if _, newRefresh, err := oauthRefresh(refreshToken); err == nil {
+			if newRefresh != "" && newRefresh != refreshToken {
+				refreshToken = newRefresh
+				_ = pulp.FS.Write("refresh_token.txt", []byte(newRefresh))
+			}
+			fmt.Println("  Token valid")
+			return nil
+		} else {
+			// Parity with native Hytale-Auth/main.go:45 — keeps the U+FE0F variation selector + double space.
+			fmt.Println(" ️  Token invalid:", err)
+			refreshToken = ""
+		}
+	}
 
 	if refreshToken == "" {
 		if err := startDeviceFlow(); err != nil {
 			return fmt.Errorf("start device flow: %w", err)
 		}
-		fmt.Printf("[hytale-auth] authorize at: %s (code: %s)\n", verificationURI, userCode)
+		fmt.Println("Authorization required")
+		fmt.Printf("   Go to: %s\n", verificationURI)
+		fmt.Printf("   Code:  %s\n", userCode)
 	}
 	return nil
 }
@@ -106,28 +161,36 @@ func status(c *pulpgin.Context) {
 		c.String(200, "Status: Needs Authorization\nURL: %s\nCode: %s\n", verificationURI, userCode)
 		return
 	}
-	if refreshToken == "" || profileUUID == "" {
-		c.String(503, "Status: Not Ready (missing credentials)")
-		return
-	}
+	// Parity with native setupHandler: once setupMode flips off, native
+	// reports "Status: Ready" unconditionally (no missing-credentials
+	// gate). Mirror that exactly so downstream byte-for-byte compare
+	// passes.
 	c.String(200, "Status: Ready\n")
 }
 
 func tokens(c *pulpgin.Context) {
+	// Parity with native tokensHandler: native gates only on setupMode,
+	// then falls through to refreshAccessToken / createSession. No
+	// separate "missing creds" 503 — if refreshToken is empty the
+	// refresh call below 500s naturally.
 	if setupMode {
-		c.String(503, "Not authorized yet. Visit / for setup.")
-		return
-	}
-	if refreshToken == "" || profileUUID == "" {
-		c.String(503, "not authorized — missing refresh_token.txt or profile_uuid.txt")
+		// Native uses http.Error which appends a trailing newline and
+		// sets Content-Type: text/plain; charset=utf-8 + nosniff. Mirror
+		// exactly (nosniff header included for byte-parity with net/http).
+		httpErrorLike(c, 503, "Not authorized yet. Visit / for setup.")
 		return
 	}
 
 	accessToken, newRefresh, err := oauthRefresh(refreshToken)
 	if err != nil {
-		c.String(500, "oauth refresh: %v", err)
+		// Native: http.Error(w, err.Error(), 500) — no label prefix.
+		httpErrorLike(c, 500, err.Error())
 		return
 	}
+	// Native saveToken is unconditional; mirror that ordering but keep
+	// the non-empty guard (Hytale OAuth always rotates, so this is a
+	// no-op in practice; the guard prevents wiping state on a spec
+	// violation).
 	if newRefresh != "" && newRefresh != refreshToken {
 		refreshToken = newRefresh
 		_ = pulp.FS.Write("refresh_token.txt", []byte(newRefresh))
@@ -135,16 +198,49 @@ func tokens(c *pulpgin.Context) {
 
 	sessionToken, identityToken, err := createSession(accessToken, profileUUID)
 	if err != nil {
-		c.String(500, "session create: %v", err)
+		httpErrorLike(c, 500, err.Error())
 		return
 	}
 
-	c.JSON(200, pulpgin.H{
+	// Native uses json.NewEncoder(w).Encode — no explicit Content-Type
+	// (Go sniffs to text/plain; charset=utf-8 for JSON) and appends a
+	// trailing newline. Mirror by marshaling + Data with sniffed CT +
+	// appended \n so the wire bytes match native exactly.
+	body, err := jsonMarshalNative(pulpgin.H{
 		"env": map[string]string{
 			"HYTALE_SERVER_SESSION_TOKEN":  sessionToken,
 			"HYTALE_SERVER_IDENTITY_TOKEN": identityToken,
 		},
 	})
+	if err != nil {
+		httpErrorLike(c, 500, err.Error())
+		return
+	}
+	// Content-Type: native doesn't set it before Encode, so Go's
+	// ResponseWriter sniffer runs on the first Write. The sniffer
+	// returns "text/plain; charset=utf-8" for JSON-starting ASCII
+	// (Go's DetectContentType has no JSON rule). Match that exactly.
+	c.Data(200, "text/plain; charset=utf-8", body)
+}
+
+// httpErrorLike mirrors net/http.Error's wire format: appends a
+// trailing newline to msg, sets Content-Type: text/plain; charset=utf-8
+// and X-Content-Type-Options: nosniff. Use wherever native calls
+// http.Error so the cell's bytes match the native service byte-for-byte.
+func httpErrorLike(c *pulpgin.Context, status int, msg string) {
+	c.Header("X-Content-Type-Options", "nosniff")
+	c.Data(status, "text/plain; charset=utf-8", []byte(msg+"\n"))
+}
+
+// jsonMarshalNative matches json.NewEncoder(w).Encode: marshals obj
+// and appends a trailing newline. encoding/json's Encoder adds the
+// newline; Marshal alone does not.
+func jsonMarshalNative(obj any) ([]byte, error) {
+	b, err := json.Marshal(obj)
+	if err != nil {
+		return nil, err
+	}
+	return append(b, '\n'), nil
 }
 
 // ---- OAuth flow --------------------------------------------------------
@@ -186,8 +282,14 @@ func startDeviceFlow() error {
 }
 
 func pollDeviceIfDue(wallNanos uint64) {
-	if lastPollNanos != 0 && wallNanos-lastPollNanos < pollIntervalSec*1_000_000_000 {
-		return
+	if lastPollNanos != 0 {
+		delta := int64(wallNanos) - int64(lastPollNanos)
+		if delta < 0 {
+			return // clock skew — wait for next tick
+		}
+		if delta < int64(pollIntervalSec)*1_000_000_000 {
+			return
+		}
 	}
 	lastPollNanos = wallNanos
 
@@ -218,7 +320,8 @@ func pollDeviceIfDue(wallNanos uint64) {
 		return
 	}
 	if parsed.Error != "" {
-		fmt.Printf("[hytale-auth] oauth error: %s\n", parsed.Error)
+		// Native pollForToken logs "Auth error:" prefix — mirror.
+		fmt.Println("Auth error:", parsed.Error)
 		return
 	}
 	if parsed.RefreshToken == "" {
@@ -228,15 +331,23 @@ func pollDeviceIfDue(wallNanos uint64) {
 	refreshToken = parsed.RefreshToken
 	_ = pulp.FS.Write("refresh_token.txt", []byte(parsed.RefreshToken))
 
-	if uuid, err := fetchProfileUUID(parsed.AccessToken); err == nil && uuid != "" {
-		profileUUID = uuid
-		_ = pulp.FS.Write("profile_uuid.txt", []byte(uuid))
+	// Fetch profile UUID from API. Native logs "Profile UUID:" on
+	// success, "Failed to fetch profile:" on error.
+	if parsed.AccessToken != "" {
+		if uuid, err := fetchProfileUUID(parsed.AccessToken); err == nil {
+			profileUUID = uuid
+			_ = pulp.FS.Write("profile_uuid.txt", []byte(uuid))
+			fmt.Println("Profile UUID:", profileUUID)
+		} else {
+			fmt.Println("Failed to fetch profile:", err)
+		}
 	}
+	// Do NOT clear deviceCode/userCode/verificationURI — native leaves
+	// them populated after success (pollForToken only flips setupMode
+	// and never zeroes the strings). Status endpoint gates on setupMode
+	// alone, so clearing here would be a silent divergence.
 	setupMode = false
-	deviceCode = ""
-	userCode = ""
-	verificationURI = ""
-	fmt.Printf("[hytale-auth] authorized, tokens saved\n")
+	fmt.Println("Authorized!")
 }
 
 func oauthRefresh(token string) (access, newRefresh string, err error) {
@@ -268,7 +379,10 @@ func oauthRefresh(token string) (access, newRefresh string, err error) {
 }
 
 func createSession(accessToken, uuid string) (sessionToken, identityToken string, err error) {
-	body := fmt.Sprintf(`{"uuid": %q}`, uuid)
+	// Use literal "%s" not %q to match native main.go's request body
+	// byte-for-byte. Native does not Go-escape the UUID; parity means
+	// we don't either. UUIDs are alphanumeric+hyphen so this is safe.
+	body := fmt.Sprintf(`{"uuid": "%s"}`, uuid)
 	resp, err := pulp.HTTP.Fetch(pulp.HTTPFetchRequest{
 		Method: "POST",
 		URL:    "https://sessions.hytale.com/game-session/new",

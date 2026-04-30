@@ -3,5 +3,9 @@
 hytale-auth
 hytale-auth.exe
 config.json
-pulp-plugin/*.wasm
-pulp-plugin/data/
+pulp-cell/*.wasm
+pulp-cell/data/
+
+pulp-deployment/*.exe
+pulp-deployment/*.exe~
+server.exe

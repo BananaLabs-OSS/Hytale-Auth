@@ -1,4 +1,4 @@
-module hytale-auth-plugin
+module hytale-auth-cell
 
 go 1.25
 
