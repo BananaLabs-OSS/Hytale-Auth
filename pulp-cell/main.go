@@ -36,6 +36,7 @@ import (
 
 	"github.com/BananaLabs-OSS/Fiber/pulp"
 	pulpgin "github.com/BananaLabs-OSS/Fiber/pulp/gin"
+	"github.com/BananaLabs-OSS/Fiber/pulp/gin/middleware"
 )
 
 func main() {}
@@ -50,14 +51,45 @@ var (
 	verificationURI string
 	pollIntervalSec uint64 = 5
 	lastPollNanos   uint64
+
+	// serviceToken gates the credential-issuing route. Read from the
+	// SERVICE_TOKEN env (set by the Pulp host) so the secret stays out of
+	// the committed pulp.cell.toml.
+	serviceToken string
 )
 
 func init() {
 	pulp.OnInit(bootstrap)
 
+	// Auth posture: auth-available-not-mandatory (matches Peel pulp-cell).
+	// GET /tokens mints LIVE Hytale server session + identity tokens — a
+	// credential-issuing endpoint — so it is gated on the X-Service-Token
+	// shared secret (constant-time, via middleware.ServiceAuth), the same
+	// SERVICE_TOKEN pattern the other cells use. Gating is enforced ONLY
+	// when SERVICE_TOKEN is non-empty: an empty token leaves /tokens
+	// unauthenticated so the existing Bananagine pre-start hook (which sends
+	// no header today) keeps working — no 401, no outage. Deliberately NOT
+	// fail-closed: an empty token must not block startup or token issuance.
+	// To ENABLE auth: set SERVICE_TOKEN here AND have Bananagine send the
+	// same X-Service-Token, in lockstep.
+	serviceToken = os.Getenv("SERVICE_TOKEN")
+
 	r := pulpgin.New()
 	r.GET("/health", health)
-	r.GET("/tokens", tokens)
+
+	// /tokens rides a root group so the path stays "/tokens" (byte-parity
+	// with native); only the auth middleware is interposed when a token is
+	// configured.
+	var minting *pulpgin.RouterGroup
+	if serviceToken != "" {
+		minting = r.Group("", middleware.ServiceAuth(serviceToken))
+		log.Printf("Token-mint auth ENABLED (X-Service-Token required on /tokens)")
+	} else {
+		minting = r.Group("")
+		log.Printf("Token-mint auth OFF (SERVICE_TOKEN empty); to enable, set SERVICE_TOKEN here AND have the Bananagine pre-start hook send X-Service-Token")
+	}
+	minting.GET("/tokens", tokens)
+
 	r.GET("/", status)
 
 	// Declare routes but compose our own OnStep so polling runs
@@ -158,7 +190,14 @@ func health(c *pulpgin.Context) {
 
 func status(c *pulpgin.Context) {
 	if setupMode {
-		c.String(200, "Status: Needs Authorization\nURL: %s\nCode: %s\n", verificationURI, userCode)
+		// The device-flow user_code is a short-lived shared secret (RFC 8628)
+		// meant only for the legitimate operator — it is already emitted to
+		// the operator console in bootstrap. Do NOT disclose it (or the
+		// pre-filled verification_uri_complete) over this unauthenticated
+		// route: any caller that reaches the port during the bootstrap window
+		// could otherwise read the code and complete the OAuth approval. The
+		// operator reads the code/URL from the cell logs instead.
+		c.String(200, "Status: Needs Authorization\nSee cell logs for the verification URL and code.\n")
 		return
 	}
 	// Parity with native setupHandler: once setupMode flips off, native
