@@ -37,6 +37,7 @@ import (
 	"github.com/BananaLabs-OSS/Fiber/pulp"
 	pulpgin "github.com/BananaLabs-OSS/Fiber/pulp/gin"
 	"github.com/BananaLabs-OSS/Fiber/pulp/gin/middleware"
+	"github.com/vmihailenco/msgpack/v5"
 )
 
 func main() {}
@@ -60,33 +61,62 @@ var (
 
 func init() {
 	pulp.OnInit(bootstrap)
+}
+
+// resolveServiceToken reads the /tokens auth secret from the manifest
+// [config] table first, then lets a SERVICE_TOKEN env var override it.
+//
+// IMPORTANT (audit fix): the config table is the PRIMARY source. The Pulp
+// host forwards only a narrow env allowlist (HTTP_PORT, TZ) into the WASI
+// sandbox — SERVICE_TOKEN is NOT among them — so an env-only token would
+// ALWAYS read empty inside the cell and the enforce-when-set auth gate on
+// the credential-minting /tokens route could never actually turn on. Reading
+// from [config] (delivered as msgpack into pulp_init) matches how the sibling
+// cells (Peel, Hand, Bunch) source their service token and makes the gate
+// configurable in practice. The env override is kept for parity but only
+// works if a future host forwards the key.
+func resolveServiceToken(configBytes []byte) string {
+	var token string
+	if len(configBytes) > 0 {
+		var raw map[string]any
+		if err := msgpack.Unmarshal(configBytes, &raw); err == nil {
+			if v, ok := raw["service_token"].(string); ok {
+				token = v
+			}
+		}
+	}
+	if env := os.Getenv("SERVICE_TOKEN"); env != "" {
+		token = env
+	}
+	return token
+}
+
+// buildRouter wires the HTTP routes + the device-poll OnStep. Called from
+// bootstrap (NOT init) because the service-token auth posture depends on the
+// manifest [config], which is only available once pulp_init delivers it.
+func buildRouter() {
+	r := pulpgin.New()
+	r.GET("/health", health)
 
 	// Auth posture: auth-available-not-mandatory (matches Peel pulp-cell).
 	// GET /tokens mints LIVE Hytale server session + identity tokens — a
 	// credential-issuing endpoint — so it is gated on the X-Service-Token
-	// shared secret (constant-time, via middleware.ServiceAuth), the same
-	// SERVICE_TOKEN pattern the other cells use. Gating is enforced ONLY
-	// when SERVICE_TOKEN is non-empty: an empty token leaves /tokens
-	// unauthenticated so the existing Bananagine pre-start hook (which sends
-	// no header today) keeps working — no 401, no outage. Deliberately NOT
-	// fail-closed: an empty token must not block startup or token issuance.
-	// To ENABLE auth: set SERVICE_TOKEN here AND have Bananagine send the
-	// same X-Service-Token, in lockstep.
-	serviceToken = os.Getenv("SERVICE_TOKEN")
-
-	r := pulpgin.New()
-	r.GET("/health", health)
-
+	// shared secret (constant-time, via middleware.ServiceAuth). Gating is
+	// enforced ONLY when serviceToken is non-empty: an empty token leaves
+	// /tokens unauthenticated so the existing Bananagine pre-start hook
+	// (which sends no header today) keeps working — no 401, no outage.
+	// Deliberately NOT fail-closed. To ENABLE auth: set service_token in the
+	// manifest [config] AND have Bananagine send the same X-Service-Token.
+	//
 	// /tokens rides a root group so the path stays "/tokens" (byte-parity
-	// with native); only the auth middleware is interposed when a token is
-	// configured.
+	// with native); only the auth middleware is interposed when configured.
 	var minting *pulpgin.RouterGroup
 	if serviceToken != "" {
 		minting = r.Group("", middleware.ServiceAuth(serviceToken))
 		log.Printf("Token-mint auth ENABLED (X-Service-Token required on /tokens)")
 	} else {
 		minting = r.Group("")
-		log.Printf("Token-mint auth OFF (SERVICE_TOKEN empty); to enable, set SERVICE_TOKEN here AND have the Bananagine pre-start hook send X-Service-Token")
+		log.Printf("Token-mint auth OFF (service_token empty); to enable, set service_token in [config] AND have the Bananagine pre-start hook send X-Service-Token")
 	}
 	minting.GET("/tokens", tokens)
 
@@ -132,7 +162,13 @@ func init() {
 // WASI's env list. The host currently forwards a narrow allowlist; if
 // the keys aren't forwarded, os.Getenv returns "" and we fall through
 // to the device flow — same net behavior as native when env is unset.
-func bootstrap(_ []byte) error {
+func bootstrap(configBytes []byte) error {
+	// Resolve the /tokens auth secret from [config] (+ optional env override)
+	// and build the router NOW — the auth posture depends on config that is
+	// only available here, not in init().
+	serviceToken = resolveServiceToken(configBytes)
+	buildRouter()
+
 	if data, err := pulp.FS.Read("refresh_token.txt"); err == nil {
 		refreshToken = strings.TrimSpace(string(data))
 	}
