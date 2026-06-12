@@ -136,7 +136,11 @@ func saveToken(token string) {
 }
 
 func createSession(accessToken string) (sessionToken string, identityToken string, err error) {
-	fmt.Println(" Creating session with account access token: ", accessToken[:20]+"...")
+	if len(accessToken) >= 20 {
+		fmt.Println(" Creating session with account access token: ", accessToken[:20]+"...")
+	} else {
+		fmt.Println(" Creating session with account access token: ", accessToken+"...")
+	}
 
 	// Build JSON body
 	body := fmt.Sprintf(`{"uuid": "%s"}`, profileUUID)
@@ -198,8 +202,11 @@ func tokensHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Save rotated refresh token
-	saveToken(newRefresh)
+	// Save rotated refresh token only when the endpoint returned one;
+	// an empty newRefresh must not blank the stored token.
+	if newRefresh != "" {
+		saveToken(newRefresh)
+	}
 
 	// Create session
 	sessionToken, identityToken, err := createSession(accessToken)
@@ -291,6 +298,13 @@ func pollForToken(interval int) {
 
 		if result.Error == "authorization_pending" {
 			continue
+		}
+		// RFC 8628 §3.5: expired_token and access_denied are terminal —
+		// the device code window has closed or the user denied. Stop polling.
+		if result.Error == "expired_token" || result.Error == "access_denied" {
+			fmt.Println("Auth failed (terminal):", result.Error)
+			setupMode = false
+			return
 		}
 		if result.Error != "" {
 			fmt.Println("Auth error:", result.Error)
