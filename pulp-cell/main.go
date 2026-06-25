@@ -391,7 +391,13 @@ func pollDeviceIfDue(wallNanos uint64) {
 	if err := json.Unmarshal(resp.Body, &parsed); err != nil {
 		return
 	}
-	if parsed.Error == "authorization_pending" || parsed.Error == "slow_down" {
+	if parsed.Error == "authorization_pending" {
+		return
+	}
+	// RFC 8628 §3.5: slow_down requires the client to permanently increase
+	// its polling interval by a minimum of 5 seconds.
+	if parsed.Error == "slow_down" {
+		pollIntervalSec += 5
 		return
 	}
 	// RFC 8628 §3.5: expired_token and access_denied are terminal —
