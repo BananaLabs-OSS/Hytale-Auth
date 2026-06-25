@@ -394,6 +394,15 @@ func pollDeviceIfDue(wallNanos uint64) {
 	if parsed.Error == "authorization_pending" || parsed.Error == "slow_down" {
 		return
 	}
+	// RFC 8628 §3.5: expired_token and access_denied are terminal —
+	// the device code window has closed or the user denied. Exit setup
+	// mode so the cell stops polling. Matches native pollForToken fix
+	// from commit 60fadbd.
+	if parsed.Error == "expired_token" || parsed.Error == "access_denied" {
+		fmt.Println("Auth failed (terminal):", parsed.Error)
+		setupMode = false
+		return
+	}
 	if parsed.Error != "" {
 		// Native pollForToken logs "Auth error:" prefix — mirror.
 		fmt.Println("Auth error:", parsed.Error)
