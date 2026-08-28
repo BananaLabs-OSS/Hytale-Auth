@@ -8,15 +8,15 @@ From [BananaLabs OSS](https://github.com/bananalabs-oss).
 
 Hytale-Auth handles OAuth 2.0 device-code flow with Hytale's auth + session services to generate server identity and session tokens. Used as a pre-start hook by Bananagine.
 
-The deployed form is a **Pulp WASM cell** (`pulp-cell/`), loaded by a thin host binary (`pulp-deployment/`). A legacy standalone native service (`main.go` at repo root) is retained as a reference implementation; the cell is canonical.
+The deployed form is a **Pulp application** (`application/`): Lua owns the OAuth workflow, generic shared engines own outbound HTTP and scoped persistence, and `api-cell/` is a thin inbound HTTP adapter. A legacy standalone native service (`main.go` at repo root) remains as a reference implementation.
 
-## Quick Start (Pulp cell)
+## Quick Start (Pulp application)
 
-Build the cell:
+Build the API adapter and shared engines, then run the application through the deployment host:
 
 ```bash
-cd pulp-cell
-GOOS=wasip1 GOARCH=wasm go build -buildmode=c-shared -o hytale-auth.wasm .
+cd api-cell
+GOOS=wasip1 GOARCH=wasm go build -o hytale-auth-api.wasm .
 ```
 
 Build and run the deployment host:
@@ -48,9 +48,9 @@ On first run, check the host logs for the device-authorization URL and code, the
 }
 ```
 
-## Configuration (cell)
+## Configuration (application)
 
-Cell configuration is set in `pulp-cell/pulp.cell.toml` under `[config]`.
+Inbound authentication is set in `api-cell/pulp.cell.toml`; Hytale endpoint and OAuth parameters are application values in `application/lua-orchestrator.cell.toml`.
 
 | Key             | Description                                                                 | Default |
 | --------------- | --------------------------------------------------------------------------- | ------- |

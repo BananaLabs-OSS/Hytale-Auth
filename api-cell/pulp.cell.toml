@@ -1,0 +1,11 @@
+name = "hytale-auth-api"
+version = "0.1.0"
+wasm = "hytale-auth-api.wasm"
+wasm_sha256 = "c77d845c12922f7f1073b19e22f31a7b0cb779e2460f03eda2249a65a013b24c"
+provides = []
+consumes = ["orchestrator.dispatch"]
+depends_on = ["lua-orchestrator"]
+capabilities = ["transport.http.inbound"]
+
+[config]
+service_token = ""

@@ -1,0 +1,15 @@
+schema_version = 1
+name = "hytale-auth"
+version = "0.1.0"
+
+cells = [
+  "../api-cell/pulp.cell.toml",
+  "../../pulp-engines/http-json-cell/pulp.cell.toml",
+  "../../pulp-engines/scoped-kv-fs-cell/pulp.cell.toml",
+  "lua-orchestrator.cell.toml",
+]
+
+[orchestrator]
+manifest = "lua-orchestrator.cell.toml"
+script = "hytale-auth.lua"
+sha256 = "ead3a805c6179f066e44f5a763086d8a93fd55ebf192253ea8ef5a564f211fa2"
